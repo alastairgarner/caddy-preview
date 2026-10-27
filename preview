@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Temporary localhost routes for an existing Caddy server. Python stdlib only."""
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import ipaddress
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+
+class PreviewError(Exception):
+    pass
+
+
+NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+TTL = re.compile(r"([1-9][0-9]*)([smhd])\Z")
+DEFAULT_DOMAIN = "dev.hp.affablegecko.net"
+
+
+def name_value(value):
+    if not NAME.fullmatch(value):
+        raise argparse.ArgumentTypeError("use a DNS label: 1–63 lowercase letters, digits or interior hyphens")
+    return value
+
+
+def port_value(value):
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer") from None
+    if not 1024 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1024 and 65535")
+    return port
+
+
+def ttl_value(value):
+    match = TTL.fullmatch(value)
+    if not match:
+        raise argparse.ArgumentTypeError("TTL must be a positive integer followed by s, m, h or d")
+    seconds = int(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match[2]]
+    if seconds > 7 * 86400:
+        raise argparse.ArgumentTypeError("maximum TTL is 7d")
+    return seconds
+
+
+def quoted(path):
+    # Caddyfile double-quoted tokens support backslash escaping.
+    return json.dumps(str(path))
+
+
+def atomic_write(path, content, mode=0o644):
+    """Replace a file durably without exposing partially written content."""
+    fd, temporary = tempfile.mkstemp(prefix=".write-", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def json_text(value):
+    return json.dumps(value, indent=2, sort_keys=True) + "\n"
+
+
+class Registry:
+    def __init__(self, args):
+        self.root = args.directory.expanduser().absolute()
+        self.main = args.caddyfile.expanduser().absolute()
+        self.caddy = args.caddy
+        self.admin = args.admin.rstrip("/")
+        self.domain = args.domain
+        self.bind = args.bind
+        self.owner = os.getuid()
+        self.timeout = args.timeout
+        if not all(NAME.fullmatch(label) for label in self.domain.split(".")) or len(self.domain) > 253:
+            raise PreviewError("invalid preview domain")
+        try:
+            ipaddress.ip_address(self.bind)
+        except ValueError:
+            raise PreviewError("bind must be an IP address") from None
+        parsed = urllib.parse.urlsplit(self.admin)
+        if (parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1", "::1")
+                or parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password):
+            raise PreviewError("admin must be a localhost HTTP origin, e.g. http://127.0.0.1:2019")
+        # Do not route privileged admin requests through HTTP_PROXY.
+        self.http = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+    @contextlib.contextmanager
+    def locked(self):
+        if not self.root.is_dir():
+            raise PreviewError(f"missing {self.root}; follow README one-time setup")
+        info = self.root.stat()
+        if info.st_uid != self.owner or info.st_mode & 0o022:
+            raise PreviewError("registry must be owned by this user and not group/world-writable")
+        with (self.root / ".lock").open("a") as lock:
+            os.chmod(self.root / ".lock", 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+
+    def current(self):
+        link = self.root / "current"
+        if not link.is_symlink():
+            raise PreviewError("registry not initialized; run preview init before adding the main import")
+        generation = link.resolve(strict=True)
+        if generation.parent != self.root or not generation.name.startswith("gen-"):
+            raise PreviewError("current points outside the registry")
+        return generation
+
+    def settings(self):
+        return {"domain": self.domain, "bind": self.bind}
+
+    def state(self, generation):
+        data = json.loads((generation / "state.json").read_text())
+        if data.get("version") != 1 or data.get("settings") != self.settings():
+            raise PreviewError("registry settings differ; use the same --domain and --bind as init")
+        routes = data["routes"]
+        if not isinstance(routes, dict):
+            raise PreviewError("invalid route state")
+        for name, route in routes.items():
+            name_value(name)
+            port_value(str(route["port"]))
+            if (not isinstance(route["owner"], int) or not isinstance(route["expires"], (float, int))
+                    or not math.isfinite(route["expires"])):
+                raise PreviewError("invalid route ownership/expiry")
+        return routes
+
+    def generation(self, routes):
+        path = Path(tempfile.mkdtemp(prefix="gen-", dir=self.root))
+        try:
+            os.chmod(path, 0o755)
+            (path / "routes").mkdir(mode=0o755)
+            # Public config contains hostnames/ports only, never credentials.
+            # Read access requires neither home traversal nor group membership.
+            os.chmod(path / "routes", 0o755)
+            for name, route in sorted(routes.items()):
+                atomic_write(path / "routes" / f"{name}.caddy", (
+                    f"@preview_{name.replace('-', '_')} host {name}.{self.domain}\n"
+                    f"handle @preview_{name.replace('-', '_')} {{\n"
+                    f"\treverse_proxy 127.0.0.1:{route['port']}\n}}\n"
+                ))
+            atomic_write(path / "Caddyfile", (
+                "# Generated by preview; do not edit.\n"
+                f"*.{self.domain} {{\n"
+                f"\tbind {self.bind}\n"
+                "\timport cloudflare_tls\n"
+                f"\timport {quoted(path / 'routes' / '*.caddy')}\n"
+                '\thandle {\n\t\trespond "Preview not registered" 404\n\t}\n}\n'
+            ))
+            atomic_write(path / "state.json", json_text({
+                "version": 1, "settings": self.settings(), "routes": routes,
+            }), mode=0o600)
+            sync_directory(path)
+            sync_directory(self.root)
+            return path
+        except BaseException:
+            shutil.rmtree(path)
+            raise
+
+    def publish(self, path):
+        temporary = self.root / (".current-" + uuid.uuid4().hex)
+        try:
+            temporary.symlink_to(path.name)
+            os.replace(temporary, self.root / "current")
+            sync_directory(self.root)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def adapt(self, generation, source=None):
+        if source is None:
+            source = self.main.read_text()
+        # Require a dedicated, literal import; never replace arbitrary config text.
+        target = str(self.root / "current" / "Caddyfile")
+        pattern = re.compile(r"(?m)^[ \t]*import[ \t]+(?:" + re.escape(quoted(target))
+                             + "|" + re.escape(target) + r")[ \t]*(?:#.*)?$")
+        source, count = pattern.subn(lambda _: "import " + quoted(generation / "Caddyfile"), source)
+        if count != 1:
+            raise PreviewError(f"main Caddyfile must contain exactly one dedicated line: import {quoted(target)}")
+        # Stdin adaptation resolves relative imports against cwd. Use the main
+        # file's directory; never write a staging file beside the root-owned main.
+        result = subprocess.run(
+            [self.caddy, "adapt", "--adapter", "caddyfile", "--config", "-"],
+            input=source.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=self.main.parent, timeout=self.timeout, check=False,
+        )
+        if result.returncode:
+            # Caddy diagnostics may contain credentials from unrelated imports.
+            raise PreviewError("combined Caddyfile adaptation failed (diagnostics suppressed to protect secrets)")
+        try:
+            parsed = json.loads(result.stdout)
+        except ValueError:
+            raise PreviewError("caddy adapt returned invalid JSON") from None
+        if not isinstance(parsed, dict):
+            raise PreviewError("caddy adapt did not return a configuration object")
+        return result.stdout
+
+    def reload(self, config):
+        request = urllib.request.Request(self.admin + "/load", data=config,
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with self.http.open(request, timeout=self.timeout) as response:
+                if response.status != 200:
+                    raise PreviewError("Caddy admin reload failed")
+        except (OSError, urllib.error.URLError, ValueError):
+            # Never print the response body: it can contain config/credentials.
+            raise PreviewError("Caddy admin reload failed or timed out") from None
+
+    def ensure_clean(self):
+        if (self.root / "pending.json").exists():
+            raise PreviewError("an interrupted/uncertain reload needs recovery; run preview recover")
+
+    def cleanup(self):
+        current = self.current()
+        for path in self.root.glob("gen-*"):
+            if path != current and path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+
+    def init(self):
+        with self.locked():
+            self.ensure_clean()
+            if (self.root / "current").exists() or (self.root / "current").is_symlink():
+                raise PreviewError("registry already initialized")
+            self.publish(self.generation({}))
+        print(f"Initialized {self.root}; no Caddy reload performed.")
+        print(f"One-time main config import: import {quoted(self.root / 'current' / 'Caddyfile')}")
+
+    def apply(self, old, routes):
+        new = self.generation(routes)
+        try:
+            # Adapt both full configs before publishing or contacting Caddy.
+            source = self.main.read_text()
+            previous_config = self.adapt(old, source)
+            config = self.adapt(new, source)
+            previous_routes = self.state(old)
+            for name in routes.keys() - previous_routes.keys():
+                if f"{name}.{self.domain}" in host_matches(json.loads(previous_config)):
+                    raise PreviewError("hostname already exists in the combined Caddy configuration")
+            if self.main.read_text() != source:
+                raise PreviewError("main Caddyfile changed during validation; retry")
+        except BaseException:
+            shutil.rmtree(new)
+            raise
+        pending = self.root / "pending.json"
+        atomic_write(pending, json_text({"previous": old.name, "proposed": new.name}), mode=0o600)
+        # A crash after this point deliberately leaves a recovery marker. Recover
+        # re-applies whichever complete generation current points to.
+        self.publish(new)
+        try:
+            self.reload(config)
+        except Exception as error:
+            self.publish(old)
+            try:
+                self.reload(previous_config)
+            except Exception:
+                raise PreviewError("reload and rollback reload failed; disk restored, live state uncertain; run preview recover") from None
+            pending.unlink()
+            sync_directory(self.root)
+            self.cleanup()
+            raise PreviewError(f"{error}; previous configuration restored") from None
+        pending.unlink()
+        sync_directory(self.root)
+        self.cleanup()
+
+    def register(self, name, port, ttl):
+        with self.locked():
+            self.ensure_clean()
+            old = self.current()
+            routes = self.state(old)
+            admin_port = urllib.parse.urlsplit(self.admin).port or 80
+            if port in (2019, admin_port):
+                raise PreviewError("refusing to expose the Caddy admin port")
+            now = time.time()
+            existing = routes.get(name)
+            if existing:
+                if existing["owner"] != self.owner:
+                    raise PreviewError("name belongs to another owner")
+                if existing["port"] != port:
+                    raise PreviewError("name already targets another port; unregister it first")
+            for other_name, route in routes.items():
+                if other_name != name and route["port"] == port:
+                    raise PreviewError(f"port already registered as {other_name}; unregister it first")
+            routes[name] = {"port": port, "owner": self.owner, "expires": now + ttl}
+            self.apply(old, routes)
+        print(f"https://{name}.{self.domain}")
+        print("Warning: expiry needs preview prune; a stale route can expose a later process reusing this port.", file=sys.stderr)
+
+    def unregister(self, name):
+        with self.locked():
+            self.ensure_clean()
+            old = self.current()
+            routes = self.state(old)
+            if name not in routes:
+                raise PreviewError("name is not registered")
+            if routes[name]["owner"] != self.owner:
+                raise PreviewError("name belongs to another owner")
+            del routes[name]
+            self.apply(old, routes)
+        print(f"Unregistered {name}")
+
+    def prune(self):
+        with self.locked():
+            self.ensure_clean()
+            old = self.current()
+            routes = self.state(old)
+            now = time.time()
+            expired = [name for name, route in routes.items()
+                       if route["expires"] <= now and route["owner"] == self.owner]
+            if expired:
+                for name in expired:
+                    del routes[name]
+                self.apply(old, routes)
+        print(f"Pruned {len(expired)} route(s)")
+
+    def list(self, as_json=False):
+        with self.locked():
+            self.ensure_clean()
+            routes = self.state(self.current())
+        now = time.time()
+        rows = [{"name": name, "url": f"https://{name}.{self.domain}", **route,
+                 "expired": route["expires"] <= now} for name, route in sorted(routes.items())]
+        if as_json:
+            print(json_text(rows), end="")
+        else:
+            for row in rows:
+                expiry = dt.datetime.fromtimestamp(row["expires"], dt.timezone.utc).isoformat()
+                print(f"{row['url']}\t127.0.0.1:{row['port']}\tuid={row['owner']}\t{expiry}"
+                      + ("\tEXPIRED (still exposed until pruned)" if row["expired"] else ""))
+
+    def recover(self):
+        with self.locked():
+            current = self.current()
+            self.state(current)
+            self.reload(self.adapt(current))
+            (self.root / "pending.json").unlink(missing_ok=True)
+            sync_directory(self.root)
+            self.cleanup()
+        print("Re-applied the published configuration; recovery complete.")
+
+
+def host_matches(value):
+    """Collect Caddy HTTP host matchers without reading the live admin config."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "host" and isinstance(child, list):
+                yield from child
+            else:
+                yield from host_matches(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from host_matches(child)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--directory", type=Path, default=Path("/etc/caddy/preview"))
+    result.add_argument("--caddyfile", type=Path, default=Path("/etc/caddy/Caddyfile"))
+    result.add_argument("--caddy", default="caddy", help="Caddy executable (must include the Cloudflare module)")
+    result.add_argument("--admin", default="http://127.0.0.1:2019")
+    result.add_argument("--domain", default=DEFAULT_DOMAIN)
+    result.add_argument("--bind", default="100.90.71.107")
+    result.add_argument("--timeout", type=float, default=30)
+    commands = result.add_subparsers(dest="command", required=True)
+    commands.add_parser("init", help="initialize files only; does not change or reload main configuration")
+    register = commands.add_parser("register", help="add or renew a name; URL goes to stdout")
+    register.add_argument("name", type=name_value)
+    register.add_argument("--port", type=port_value, required=True)
+    register.add_argument("--ttl", type=ttl_value, default=7200)
+    listing = commands.add_parser("list")
+    listing.add_argument("--json", action="store_true")
+    unregister = commands.add_parser("unregister")
+    unregister.add_argument("name", type=name_value)
+    commands.add_parser("prune")
+    commands.add_parser("recover", help="reload the published generation after interruption/uncertainty")
+    return result
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise PreviewError("timeout must be positive and finite")
+        registry = Registry(args)
+        if args.command == "register":
+            registry.register(args.name, args.port, args.ttl)
+        elif args.command == "unregister":
+            registry.unregister(args.name)
+        elif args.command == "list":
+            registry.list(args.json)
+        else:
+            getattr(registry, args.command)()
+    except (PreviewError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        # Avoid dumping an exception's config-bearing subprocess output.
+        message = str(error) if isinstance(error, PreviewError) else "operation failed; check permissions, state and Caddy availability"
+        print(f"preview: {message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
